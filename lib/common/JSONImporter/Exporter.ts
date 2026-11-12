@@ -237,8 +237,14 @@ export class Exporter {
     promiseQueue: Promise<void>[],
     _omitted: Set<string>,
   ) {
+    // WebGME stores a relation as a set when its max is not 1. Those rules
+    // are still pointer meta, and they have to be exported with the pointers.
+    const names = new Set([
+      ...this.core.getOwnValidPointerNames(node),
+      ...this.core.getOwnValidSetNames(node),
+    ]);
     promiseQueue.push(
-      ...this.core.getOwnValidPointerNames(node).map(async (name) => {
+      ...Array.from(names).map(async (name) => {
         const ptr_meta = this.core.getPointerMeta(node, name);
         json.pointer_meta[name] = await this._metaDictToGuids(ptr_meta);
       }),
