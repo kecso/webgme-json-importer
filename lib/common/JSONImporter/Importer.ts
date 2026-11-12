@@ -48,7 +48,9 @@ export class Importer {
     );
 
     const parent = this.core.getParent(node);
-    const parentPath = this.core.getPath(parent) || "";
+    // The project root has no parent. A full-project state is applied to
+    // that node in place; "" is the root path the rest of the importer uses.
+    const parentPath = parent ? this.core.getPath(parent) : "";
     const nodePath = this.core.getPath(node);
     const diffs = [];
     const children = state.children || [];
@@ -58,11 +60,18 @@ export class Importer {
         await Promise.all(
           children.map(async (childState) => {
             const idString = childState.id;
-            const childNode = await this.findNode(
+            let childNode = await this.findNode(
               node,
               idString,
               resolvedSelectors,
             );
+            if (!childNode) {
+              childNode = await this.adoptProjectFco(
+                node,
+                childState,
+                resolvedSelectors,
+              );
+            }
             const index = currentChildren.indexOf(childNode);
             if (index > -1) {
               currentChildren.splice(index, 1);
@@ -156,19 +165,52 @@ export class Importer {
       });
     };
 
-    await Promise.all(apply(firstOrderDiffs));
-    await Promise.all(apply(dependentDiffs));
+    const creates = [];
+    const rest = [];
+    dependentDiffs.forEach((diff) => {
+      if (diff.type === "put" && diff.key[0] === "children") creates.push(diff);
+      else rest.push(diff);
+    });
+    // @id nodes first, then every other new node, then rules that name them.
+    // A reference that is still unresolved is retried after those nodes exist.
+    await this.applyUntilResolved(firstOrderDiffs, apply);
+    await this.applyUntilResolved(creates, apply);
+    await this.applyUntilResolved(rest, apply);
+  }
+
+  async applyUntilResolved(diffs, apply) {
+    let pending = diffs.slice();
+    let lastError = null;
+    for (let pass = 0; pass < 8 && pending.length; pass++) {
+      const failed = [];
+      for (let i = 0; i < pending.length; i++) {
+        try {
+          await apply([pending[i]])[0];
+        } catch (err) {
+          if (err && /Could not resolve/.test(err.message)) {
+            lastError = err;
+            failed.push(pending[i]);
+          } else {
+            throw err;
+          }
+        }
+      }
+      if (!failed.length) return;
+      if (failed.length === pending.length) break;
+      pending = failed;
+    }
+    if (pending.length) throw lastError;
   }
 
   _partitionDiffsByPriority(diffs) {
     const isIdBasedCreation = (diff) => {
       const type = diff.type;
       const [key] = diff.key;
-      const nodeSelectorKey = diff.nodeId.slice(0, 2);
       return (
         type === "put" &&
         key === "children" &&
-        nodeSelectorKey === "@id"
+        typeof diff.nodeId === "string" &&
+        diff.nodeId.startsWith("@id")
       );
     };
     return partition(diffs, isIdBasedCreation);
@@ -291,6 +333,14 @@ export class Importer {
         { id: this.core.getPath(node) },
         resolvedSelectors,
       );
+    } else {
+      // Bind the document identity onto the project root. @guid selectors are
+      // absolute, so later patches can find ROOT without a parent path.
+      this.bindStateIdentity(node, state, resolvedSelectors);
+      const currentGuid = this.core.getGuid(node);
+      if (currentGuid && currentGuid !== state.guid && currentGuid !== state.id) {
+        resolvedSelectors.record("", new NodeSelector(currentGuid), node);
+      }
     }
     if (state.id && parent) {
       this.resolveSelector(node, state, resolvedSelectors);
@@ -364,14 +414,103 @@ export class Importer {
     return node;
   }
 
+  clearMemberValues(node, set, kind) {
+    if (!this.core.getSetNames(node).includes(set)) return;
+    const members = this.core.getMemberPaths(node, set) || [];
+    members.forEach((memberPath) => {
+      const names = kind === "registry"
+        ? this.core.getMemberRegistryNames(node, set, memberPath)
+        : this.core.getMemberAttributeNames(node, set, memberPath);
+      names.forEach((name) => {
+        if (kind === "registry") {
+          this.core.delMemberRegistry(node, set, memberPath, name);
+        } else {
+          this.core.delMemberAttribute(node, set, memberPath, name);
+        }
+      });
+    });
+  }
+
+  bindStateIdentity(node, state, resolvedSelectors) {
+    const parent = this.core.getParent(node);
+    const parentId = parent ? this.core.getPath(parent) : "";
+    if (state.id) {
+      resolvedSelectors.record(
+        parentId,
+        new NodeSelector(state.id),
+        node,
+      );
+    }
+    if (state.guid && state.guid !== state.id) {
+      resolvedSelectors.record(
+        parentId,
+        new NodeSelector(state.guid),
+        node,
+      );
+    }
+  }
+
+  /**
+   * FCO is the only node whose base is null, and every project already has it
+   * at /1. A full-project document names that node with its own GUID; adopt
+   * the existing FCO instead of creating a second one.
+   */
+  async adoptProjectFco(parent, state, resolvedSelectors) {
+    if (this.core.getPath(parent) !== "") return null;
+    if (!state || !state.pointers || state.pointers.base !== null) return null;
+    const name = state.attributes && state.attributes.name;
+    if (state.path !== "/1" && name !== "FCO") return null;
+    const fco = await this.core.loadByPath(this.rootNode, "/1");
+    if (!fco) return null;
+    this.bindStateIdentity(fco, state, resolvedSelectors);
+    // Diffs computed before setGuid still name FCO by the guid it has now.
+    const currentGuid = this.core.getGuid(fco);
+    if (currentGuid && currentGuid !== state.guid && currentGuid !== state.id) {
+      resolvedSelectors.record("", new NodeSelector(currentGuid), fco);
+    }
+    return fco;
+  }
+
   async createStateSubTree(parentPath, state, resolvedSelectors) {
     const base = state.pointers?.base;
     const parent = await this.core.loadByPath(this.rootNode, parentPath);
+    if (state.id) {
+      const existing = await this.findNode(parent, state.id, resolvedSelectors);
+      if (existing) {
+        const nodeState = await this.toJSON(
+          existing,
+          new OmittedProperties(["children"]),
+        );
+        const changes = gmeDiff(nodeState, state);
+        for (let i = 0; i < changes.length; i++) {
+          await this._put(existing, changes[i], resolvedSelectors);
+        }
+        const childStates = state.children || [];
+        for (let i = 0; i < childStates.length; i++) {
+          await this.createStateSubTree(
+            this.core.getPath(existing),
+            childStates[i],
+            resolvedSelectors,
+          );
+        }
+        return existing;
+      }
+    }
+    if (base === null) {
+      const fco = await this.adoptProjectFco(
+        parent,
+        state,
+        resolvedSelectors,
+      );
+      if (fco) return fco;
+      const stateID = state.id || JSON.stringify(state);
+      throw new Error(`No base provided for ${stateID}`);
+    }
     const baseNode = await this.findNode(parent, base, resolvedSelectors);
     const created = await this.createNode(parent, state, baseNode);
     const nodeSelector = new NodeSelector(this.core.getPath(created));
     resolvedSelectors.record(parentPath, nodeSelector, created);
-    if (state.id && !state.id.startsWith("@internal")) {
+    if (state.id) {
       const alternateSelector = new NodeSelector(state.id);
       resolvedSelectors.record(parentPath, alternateSelector, created);
     }
@@ -636,6 +775,9 @@ Importer.prototype._put.children_meta = async function (
   resolvedSelectors,
 ) {
   const [, /*"children_meta"*/ idOrUndef] = change.key;
+  // A self-containment diff can emit a put whose value is missing. The
+  // containment itself arrives as a separate change with min/max.
+  if (change.value == null) return;
   const isAddingContainment = !idOrUndef;
   const isNewChildDefinition = typeof idOrUndef === "string";
   if (isAddingContainment) {
@@ -744,6 +886,10 @@ Importer.prototype._delete.member_attributes = async function (
   resolvedSelectors,
 ) {
   const [, /*type*/ set, nodeId, name] = change.key;
+  if (nodeId === undefined) {
+    this.clearMemberValues(node, set, "attribute");
+    return;
+  }
   const gmeId = await this.getNodeId(node, nodeId, resolvedSelectors);
   const deleteAllAttributes = name === undefined;
   const isMember = this.core.getMemberPaths(node, set).includes(gmeId);
@@ -806,6 +952,10 @@ Importer.prototype._delete.member_registry = async function (
   resolvedSelectors,
 ) {
   const [, /*type*/ set, nodeId, name] = change.key;
+  if (nodeId === undefined) {
+    this.clearMemberValues(node, set, "registry");
+    return;
+  }
   const gmeId = await this.getNodeId(node, nodeId, resolvedSelectors);
   const deleteAllRegistryValues = name === undefined;
   const isMember = this.core.getMemberPaths(node, set).includes(gmeId);
