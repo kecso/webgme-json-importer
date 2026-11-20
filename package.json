@@ -18,9 +18,22 @@
     "prepare": "npm run build"
   },
   "version": "1.4.1",
+  "main": "src/common/build/JSONImporter.umd.js",
+  "exports": {
+    ".": "./src/common/build/JSONImporter.umd.js",
+    "./package.json": "./package.json"
+  },
   "files": ["config/", "src/", "app.js", "webgme-setup.json"],
   "peerDependencies": {
     "webgme": "^2.23.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kecso/webgme-json-importer.git"
+  },
+  "homepage": "https://github.com/kecso/webgme-json-importer",
+  "bugs": {
+    "url": "https://github.com/kecso/webgme-json-importer/issues"
   },
   "devDependencies": {
     "@types/node": "^18.7.18",
